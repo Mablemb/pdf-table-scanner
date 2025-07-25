@@ -29,6 +29,9 @@ O PDF Table Scanner é uma aplicação desktop desenvolvida em Python que permit
 - **Tabelas Multi-página**: Suporte para tabelas que se estendem por várias páginas
 - **Preview Visual**: Visualização em tempo real da área sendo selecionada
 - **Exportação Automática**: Salvamento automático das tabelas como imagens PNG
+- **Visualizador de Tabelas**: Interface dedicada para visualizar tabelas extraídas
+- **Conversão para JSONL**: Ferramenta para converter tabelas em formato estruturado JSON
+- **Editor de Estrutura**: Interface intuitiva para editar metadados e estrutura das tabelas
 
 ## 🛠️ Tecnologias Utilizadas
 
@@ -36,6 +39,8 @@ O PDF Table Scanner é uma aplicação desktop desenvolvida em Python que permit
 - **PyQt5** - Interface gráfica
 - **PyMuPDF (fitz)** - Processamento de documentos PDF
 - **PIL/Pillow** - Manipulação de imagens
+- **pandas** - Processamento de dados (opcional, para scripts auxiliares)
+- **openpyxl** - Exportação para Excel (opcional)
 
 ## 📦 Instalação
 
@@ -48,7 +53,13 @@ Certifique-se de ter Python 3.6+ instalado em seu sistema.
 Instale as dependências necessárias:
 
 ```bash
-pip install PyQt5 PyMuPDF Pillow
+pip install PyQt5 PyMuPDF Pillow pandas openpyxl
+```
+
+Ou use o arquivo de requisitos:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ### Clone do Repositório
@@ -90,19 +101,58 @@ python extrator_tabelas_pdf.py
 2. Escolha a pasta de destino
 3. As tabelas serão salvas com nomes descritivos
 
+### 5. Visualizar e Converter Tabelas
+
+1. Clique no botão "Visualizar Tabelas Extraídas"
+2. Selecione uma tabela na lista suspensa
+3. Preencha os metadados (fonte, título)
+4. Configure as subseções da tabela:
+   - Adicione o nome da subseção
+   - Defina os cabeçalhos (separados por vírgula)
+   - Preencha os dados na tabela interativa
+5. Use os botões para adicionar/remover linhas e colunas
+6. Visualize o preview JSON na aba correspondente
+7. Salve em formato JSONL individual ou exporte todas
+
+#### Formato JSONL Gerado
+
+O sistema gera arquivos JSONL seguindo esta estrutura:
+
+```json
+{
+  "type": "table",
+  "source": "Nome da fonte",
+  "title": "Título da tabela",
+  "text": [
+    {
+      "subsection": "Nome da subseção",
+      "headers": ["Cabeçalho 1", "Cabeçalho 2", "Cabeçalho 3"],
+      "rows": [
+        ["Dado 1", "Dado 2", "Dado 3"],
+        ["Dado 4", "Dado 5", "Dado 6"]
+      ]
+    }
+  ]
+}
+```
+
 ## 📁 Estrutura do Projeto
 
 ```
 pdf-table-scanner/
 ├── extrator_tabelas_pdf.py    # Aplicação principal
+├── processar_jsonl.py         # Script para processar dados JSONL
 ├── LivrosPDF/                 # Pasta com PDFs de exemplo
 │   ├── Manual-BLS.pdf
 │   ├── apostilafinal.pdf
 │   └── ...
 ├── tabelas/                   # Pasta com tabelas extraídas
 │   ├── Manual-BLS_pagina_1_tabela_1.png
+│   ├── Manual-BLS_pagina_1_tabela_1.jsonl
 │   └── ...
+├── dados_processados/         # Dados processados (Excel, CSV)
 ├── README.md                  # Este arquivo
+├── JSONL_GUIDE.md            # Guia de conversão JSONL
 └── requirements.txt           # Dependências do projeto
 ```
 
@@ -208,6 +258,42 @@ Para suporte, abra uma issue no [GitHub](https://github.com/Mablemb/pdf-table-sc
 - [ ] Interface para edição de seleções
 - [ ] Suporte para batch processing
 - [ ] Histórico de extrações
+
+## 📊 Processamento de Dados
+
+### Script de Processamento Automático
+
+O projeto inclui um script Python (`processar_jsonl.py`) para processar os arquivos JSONL gerados:
+
+```bash
+python processar_jsonl.py
+```
+
+#### Funcionalidades do Script:
+- **Carregamento de JSONL**: Lê todos os arquivos `.jsonl` da pasta `tabelas/`
+- **Conversão para DataFrame**: Converte dados em estruturas pandas
+- **Exportação para Excel**: Cria arquivo Excel com múltiplas abas
+- **Exportação para CSV**: Gera arquivos CSV individuais por subseção
+- **Relatórios**: Gera relatórios textuais das tabelas
+- **Análises Específicas**: Inclui análises customizadas (ex: Escala Glasgow)
+
+#### Exemplo de Uso Programático:
+
+```python
+from processar_jsonl import carregar_jsonl, extrair_dados_tabela
+
+# Carrega dados
+dados = carregar_jsonl("tabelas/exemplo.jsonl")
+
+# Converte para DataFrames
+for tabela in dados:
+    dataframes = extrair_dados_tabela(tabela)
+    
+    # Processa cada subseção
+    for df in dataframes:
+        print(f"Subseção: {df.attrs['subsection']}")
+        print(df.head())
+```
 
 ---
 

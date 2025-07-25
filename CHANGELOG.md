@@ -7,6 +7,40 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Não Lançado]
 
+### ✨ Adicionado
+- **Visualizador de Tabelas**: Interface dedicada para visualizar tabelas extraídas
+- **Conversão para JSONL**: Ferramenta para converter tabelas em formato estruturado JSON
+- **Editor de Estrutura**: Interface intuitiva para editar metadados e estrutura das tabelas
+- **Sistema de Subseções**: Suporte para tabelas com múltiplas subseções organizadas
+- **Preview JSON**: Visualização em tempo real do JSON gerado
+- **Exportação JSONL**: Salvamento individual ou em lote de arquivos JSONL
+- **Script de Processamento**: Utilitário Python para processar dados JSONL
+- **Conversão para Excel/CSV**: Exportação automática para formatos de planilha
+- **Relatórios Automáticos**: Geração de relatórios textuais das tabelas
+- **Interface com Tabs**: Organização em abas para metadados, estrutura e preview
+- **Editor de Tabela Interativo**: Adição/remoção dinâmica de linhas e colunas
+
+### 🎨 Interface
+- Botão "Visualizar Tabelas Extraídas" na interface principal
+- Seletor dropdown para escolha de tabelas
+- Painel dividido para visualização de imagem e edição de dados
+- Campos específicos para tipo, fonte e título das tabelas
+- Sistema de cabeçalhos configuráveis
+- Botões para gerenciar estrutura da tabela
+
+### 🔧 Funcionalidades Técnicas
+- Parsing automático de nomes de arquivos para metadados
+- Validação de dados antes da exportação
+- Suporte para múltiplos formatos de saída (JSONL, Excel, CSV)
+- Sistema de atributos para preservar metadados em DataFrames
+- Análises específicas por tipo de tabela (exemplo: Escala Glasgow)
+- Tratamento robusto de erros durante conversão
+
+### 📁 Novos Arquivos
+- `JSONL_GUIDE.md` - Guia completo de conversão para JSONL
+- `processar_jsonl.py` - Script para processamento automático de dados
+- `tabelas/exemplo_glasgow.jsonl` - Exemplo de arquivo JSONL gerado
+
 ### 🎯 Planejado
 - Suporte para OCR nas tabelas extraídas
 - Exportação para formatos CSV/Excel

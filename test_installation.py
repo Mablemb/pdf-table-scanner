@@ -25,8 +25,13 @@ def test_dependencies():
     dependencies = [
         ("PyQt5", "PyQt5"),
         ("PyMuPDF", "fitz"),
-        ("Pillow", "PIL")
+        ("Pillow", "PIL"),
+        ("pandas", "pandas"),
+        ("openpyxl", "openpyxl")
     ]
+    
+    required_deps = ["PyQt5", "PyMuPDF", "Pillow"]
+    optional_deps = ["pandas", "openpyxl"]
     
     all_ok = True
     
@@ -52,9 +57,13 @@ def test_dependencies():
             print(f"✅ {name}{version} - OK")
         
         except ImportError as e:
-            print(f"❌ {name} - ERRO: {e}")
-            print(f"   Execute: pip install {name}")
-            all_ok = False
+            if name in required_deps:
+                print(f"❌ {name} - ERRO: {e}")
+                print(f"   Execute: pip install {name}")
+                all_ok = False
+            else:
+                print(f"⚠️ {name} - OPCIONAL: {e}")
+                print(f"   Execute: pip install {name} (para funcionalidades avançadas)")
         except Exception as e:
             print(f"⚠️ {name} - Importado mas com problemas: {e}")
     
