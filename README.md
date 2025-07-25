@@ -1,5 +1,15 @@
 # PDF Table Scanner
 
+![Python](https://img.shields.io/badge/python-v3.6+-blue.svg)
+![PyQt5](https://img.shields.io/badge/PyQt5-v5.15+-green.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Status](https://img.shields.io/badge/status-active-brightgreen.svg)
+
+> **English**: Interactive desktop application for extracting tables from PDF documents with visual selection and multi-page support.
+
+> **Português**: Aplicação desktop interativa para extração de tabelas de documentos PDF com seleção visual e suporte multi-página.
+
 Um extrator de tabelas de PDF com interface gráfica que permite selecionar e extrair tabelas de documentos PDF como imagens PNG.
 
 ## 📋 Descrição
