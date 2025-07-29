@@ -27,6 +27,7 @@ import pandas as pd
 import datetime
 import openai
 from opencv_table_detector import OpenCVTableDetector, TesseractTableDetector
+from multi_pass_detector import MultiPassTableDetector
 
 
 class PDFLoaderThread(QThread):
@@ -846,10 +847,18 @@ class AdvancedTableDetector(QWidget):
         self.method_combo = QComboBox()
         self.method_combo.addItems([
             "OpenCV (Linhas e Contornos)",
+            "OpenCV Multi-Passadas (Múltiplas Tabelas)",
             "Tesseract OCR (Análise de Texto)", 
             "Híbrido (OpenCV + Tesseract)"
         ])
-        self.method_combo.setCurrentIndex(2)  # Híbrido por padrão
+        self.method_combo.setCurrentIndex(3)  # Híbrido por padrão
+        self.method_combo.setToolTip(
+            "• OpenCV: Detecção baseada em linhas e contornos\n"
+            "• OpenCV Multi-Passadas: Para páginas com múltiplas tabelas - "
+            "extrai uma tabela por vez, pintando de branco as já extraídas\n"
+            "• Tesseract OCR: Análise baseada em texto\n"
+            "• Híbrido: Combina OpenCV e Tesseract"
+        )
         config_layout.addRow("Método:", self.method_combo)
         
         # Páginas
@@ -985,7 +994,11 @@ class AdvancedTableDetector(QWidget):
         self.results_list.clear()
         
         # Escolher detector baseado no método
-        if "OpenCV" in method:
+        if "OpenCV Multi-Passadas" in method:
+            min_area = int(self.min_area_input.text() or "5000")
+            max_passes = 5  # Máximo de 5 passadas
+            self.detector_thread = MultiPassTableDetector(self.pdf_path, pages, max_passes)
+        elif "OpenCV" in method:
             min_area = int(self.min_area_input.text() or "5000")
             self.detector_thread = OpenCVTableDetector(self.pdf_path, pages, min_area)
         elif "Tesseract" in method:
