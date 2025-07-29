@@ -10,7 +10,8 @@ import fitz  # PyMuPDF
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog, QPushButton, 
     QScrollArea, QFrame, QMessageBox, QProgressBar, QTabWidget, QSpinBox, QLineEdit,
-    QGroupBox, QFormLayout, QTextEdit, QCheckBox
+    QGroupBox, QFormLayout, QTextEdit, QCheckBox, QComboBox, QListWidget, QListWidgetItem,
+    QSplitter
 )
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QCursor, QPolygon, QFont
 from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, QThread
@@ -21,8 +22,11 @@ import datetime
 import platform
 import subprocess
 import base64
-
+import camelot
+import pandas as pd
+import datetime
 import openai
+from opencv_table_detector import OpenCVTableDetector, TesseractTableDetector
 
 
 class PDFLoaderThread(QThread):
@@ -112,6 +116,121 @@ class PDFLoaderThread(QThread):
     
     def stop(self):
         """Para o carregamento"""
+        self.should_stop = True
+
+
+class CamelotTableDetector(QThread):
+    """Thread para detecção automática de tabelas usando Camelot"""
+    progress_updated = pyqtSignal(int, str)  # progresso, mensagem
+    tables_detected = pyqtSignal(list)       # lista de tabelas detectadas
+    error_occurred = pyqtSignal(str)         # erro
+    pdf_type_detected = pyqtSignal(str, bool)  # tipo_pdf, tem_texto
+    
+    def __init__(self, pdf_path, pages="all", method="stream"):
+        super().__init__()
+        self.pdf_path = pdf_path
+        self.pages = pages
+        self.method = method  # "stream" ou "lattice"
+        self.should_stop = False
+    
+    def check_pdf_type(self):
+        """Verifica se o PDF é baseado em texto ou imagens"""
+        try:
+            import fitz
+            doc = fitz.open(self.pdf_path)
+            total_pages = len(doc)
+            
+            # Verificar as primeiras 5 páginas para determinar o tipo
+            text_pages = 0
+            pages_to_check = min(5, total_pages)
+            
+            for i in range(pages_to_check):
+                page = doc[i]
+                text = page.get_text().strip()
+                if len(text) > 50:  # Considerar página com texto se tiver mais de 50 caracteres
+                    text_pages += 1
+            
+            doc.close()
+            
+            # Se pelo menos 40% das páginas verificadas têm texto, considerar como PDF com texto
+            has_text = (text_pages / pages_to_check) >= 0.4
+            
+            if has_text:
+                pdf_type = "text-based"
+            else:
+                pdf_type = "image-based"
+                
+            return pdf_type, has_text, total_pages
+            
+        except Exception as e:
+            return "unknown", False, 0
+    
+    def run(self):
+        """Executa a detecção de tabelas"""
+        try:
+            self.progress_updated.emit(5, "Analisando tipo de PDF...")
+            
+            # Verificar tipo do PDF primeiro
+            pdf_type, has_text, total_pages = self.check_pdf_type()
+            self.pdf_type_detected.emit(pdf_type, has_text)
+            
+            if not has_text:
+                self.error_occurred.emit(
+                    f"⚠️ PDF Baseado em Imagens Detectado\n\n"
+                    f"O arquivo '{os.path.basename(self.pdf_path)}' é um PDF escaneado (baseado em imagens) "
+                    f"com {total_pages} páginas.\n\n"
+                    f"🔍 O Camelot só funciona com PDFs que contêm texto selecionável.\n\n"
+                    f"💡 Soluções alternativas:\n"
+                    f"• Use a aba '📄 Seleção Manual' para recortar tabelas visualmente\n"
+                    f"• Use a aba '🤖 IA - Extração Automática' para extrair tabelas com GPT-4 Vision\n"
+                    f"• Converta o PDF para texto usando OCR antes de usar o Camelot\n\n"
+                    f"📋 Páginas verificadas: {min(5, total_pages)} de {total_pages}"
+                )
+                return
+            
+            self.progress_updated.emit(15, f"PDF com texto detectado. Iniciando detecção...")
+            
+            # Detectar tabelas com Camelot
+            if self.pages == "all":
+                tables = camelot.read_pdf(self.pdf_path, flavor=self.method)
+            else:
+                tables = camelot.read_pdf(self.pdf_path, pages=str(self.pages), flavor=self.method)
+            
+            if self.should_stop:
+                return
+            
+            self.progress_updated.emit(50, f"Processando {len(tables)} tabelas encontradas...")
+            
+            # Processar resultados
+            detected_tables = []
+            for i, table in enumerate(tables):
+                if self.should_stop:
+                    break
+                
+                # Informações da tabela
+                table_info = {
+                    "index": i,
+                    "page": int(table.page),
+                    "bbox": table._bbox,  # (x1, y1, x2, y2)
+                    "accuracy": table.accuracy if hasattr(table, 'accuracy') else 0.0,
+                    "shape": table.shape,
+                    "data": table.df.to_dict('records') if len(table.df) > 0 else [],
+                    "preview": table.df.head(3).to_string() if len(table.df) > 0 else "Tabela vazia"
+                }
+                detected_tables.append(table_info)
+                
+                # Atualizar progresso
+                progress = 50 + int((i / len(tables)) * 40)
+                self.progress_updated.emit(progress, f"Processando tabela {i+1}/{len(tables)}")
+            
+            self.progress_updated.emit(100, f"Detecção concluída! {len(detected_tables)} tabelas encontradas")
+            self.tables_detected.emit(detected_tables)
+            
+        except Exception as e:
+            self.error_occurred.emit(f"Erro na detecção: {str(e)}")
+    
+    def stop(self):
+        """Para a detecção"""
         self.should_stop = True
 
 
@@ -285,7 +404,7 @@ Analise a imagem e retorne APENAS o JSON estruturado, sem explicações adiciona
             self.progress_updated.emit(30, "Enviando para OpenAI...")
             # Configurar client
             client = openai.OpenAI(api_key=self.api_key)
-            # Chamada conforme docs https://platform.openai.com/docs/guides/images-vision?api-mode=responses&format=base64-encoded#analyze-images
+            # Chamada usando a API oficial conforme documentação OpenAI
             response = client.responses.create(
                 model="gpt-4o",
                 input=[
@@ -301,7 +420,7 @@ Analise a imagem e retorne APENAS o JSON estruturado, sem explicações adiciona
             if self.should_stop:
                 return
             self.progress_updated.emit(70, "Analisando resposta...")
-            # A resposta já vem como texto JSON
+            # A resposta vem no formato output_text
             content = response.output_text
             try:
                 extracted_data = json.loads(content.strip())
@@ -653,6 +772,1124 @@ class AITableExtractorWidget(QWidget):
                 
             except Exception as e:
                 QMessageBox.critical(self, "Erro", f"Erro ao salvar arquivo:\n{str(e)}")
+
+
+class AdvancedTableDetector(QWidget):
+    """Aba para métodos avançados de detecção automática de tabelas"""
+    
+    def __init__(self):
+        super().__init__()
+        self.pdf_path = None
+        self.detector_thread = None
+        self.detected_tables = []
+        self.init_ui()
+    
+    def init_ui(self):
+        """Inicializa a interface da aba de detecção avançada"""
+        layout = QVBoxLayout(self)
+        
+        # Título principal
+        title = QLabel("🔬 Detecção Automática Avançada")
+        title.setFont(QFont("Arial", 18, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #2c3e50; margin: 15px; padding: 10px;")
+        layout.addWidget(title)
+        
+        # Descrição dos métodos
+        description = QLabel("""
+        <b>🎯 Métodos Disponíveis:</b><br>
+        <b>• OpenCV:</b> Detecta linhas e contornos para encontrar tabelas com bordas<br>
+        <b>• Tesseract OCR:</b> Analisa alinhamento de texto para detectar estruturas tabulares<br>
+        <b>• Híbrido:</b> Combina ambos os métodos para maior precisão
+        """)
+        description.setStyleSheet("background-color: #f8f9fa; padding: 15px; border-radius: 8px; color: #2c3e50;")
+        layout.addWidget(description)
+        
+        # Seção de seleção de arquivo
+        file_section = QGroupBox("📁 Selecionar PDF")
+        file_layout = QVBoxLayout(file_section)
+        
+        file_controls = QHBoxLayout()
+        
+        self.select_pdf_btn = QPushButton("📂 Escolher PDF")
+        self.select_pdf_btn.clicked.connect(self.select_pdf)
+        self.select_pdf_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                font-weight: bold;
+                padding: 15px 30px;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        
+        self.pdf_info_label = QLabel("Nenhum PDF selecionado")
+        self.pdf_info_label.setStyleSheet("color: #7f8c8d; font-style: italic; padding: 10px;")
+        
+        file_controls.addWidget(self.select_pdf_btn)
+        file_controls.addWidget(self.pdf_info_label)
+        file_controls.addStretch()
+        
+        file_layout.addLayout(file_controls)
+        layout.addWidget(file_section)
+        
+        # Configurações
+        config_section = QGroupBox("⚙️ Configurações de Detecção")
+        config_layout = QFormLayout(config_section)
+        
+        # Método de detecção
+        self.method_combo = QComboBox()
+        self.method_combo.addItems([
+            "OpenCV (Linhas e Contornos)",
+            "Tesseract OCR (Análise de Texto)", 
+            "Híbrido (OpenCV + Tesseract)"
+        ])
+        self.method_combo.setCurrentIndex(2)  # Híbrido por padrão
+        config_layout.addRow("Método:", self.method_combo)
+        
+        # Páginas
+        self.pages_input = QLineEdit()
+        self.pages_input.setPlaceholderText("Ex: 1,3,5-10 ou deixe vazio para todas as páginas")
+        config_layout.addRow("Páginas:", self.pages_input)
+        
+        # Configurações OpenCV
+        opencv_group = QGroupBox("Configurações OpenCV")
+        opencv_layout = QFormLayout(opencv_group)
+        
+        self.min_area_input = QLineEdit("3000")  # Reduzido de 5000 para 3000
+        self.min_area_input.setPlaceholderText("3000")
+        opencv_layout.addRow("Área Mínima da Tabela:", self.min_area_input)
+        
+        config_layout.addRow("", opencv_group)
+        
+        # Configurações Tesseract
+        tesseract_group = QGroupBox("Configurações Tesseract")
+        tesseract_layout = QFormLayout(tesseract_group)
+        
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(["por", "eng", "spa", "fra"])
+        self.language_combo.setCurrentText("por")
+        tesseract_layout.addRow("Idioma:", self.language_combo)
+        
+        config_layout.addRow("", tesseract_group)
+        
+        layout.addWidget(config_section)
+        
+        # Botões de ação
+        action_layout = QHBoxLayout()
+        
+        self.detect_btn = QPushButton("🚀 Iniciar Detecção")
+        self.detect_btn.clicked.connect(self.start_detection)
+        self.detect_btn.setEnabled(False)
+        self.detect_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-weight: bold;
+                padding: 15px 30px;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #2ecc71;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+        """)
+        
+        self.preview_btn = QPushButton("👁️ Preview")
+        self.preview_btn.clicked.connect(self.preview_selected)
+        self.preview_btn.setEnabled(False)
+        
+        self.export_btn = QPushButton("💾 Exportar Selecionadas")
+        self.export_btn.clicked.connect(self.export_tables)
+        self.export_btn.setEnabled(False)
+        
+        action_layout.addWidget(self.detect_btn)
+        action_layout.addWidget(self.preview_btn)
+        action_layout.addWidget(self.export_btn)
+        action_layout.addStretch()
+        
+        layout.addLayout(action_layout)
+        
+        # Progresso
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_label = QLabel("")
+        self.progress_label.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.progress_label)
+        
+        # Lista de resultados
+        results_section = QGroupBox("📋 Tabelas Detectadas")
+        results_layout = QVBoxLayout(results_section)
+        
+        self.results_info_label = QLabel("Aguardando detecção...")
+        self.results_info_label.setAlignment(Qt.AlignCenter)
+        self.results_info_label.setStyleSheet("color: #7f8c8d; font-style: italic; padding: 10px;")
+        results_layout.addWidget(self.results_info_label)
+        
+        self.results_list = QListWidget()
+        self.results_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.results_list.itemSelectionChanged.connect(self.on_selection_changed)
+        results_layout.addWidget(self.results_list)
+        
+        layout.addWidget(results_section)
+    
+    def select_pdf(self):
+        """Seleciona PDF para análise"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar PDF para Detecção Avançada",
+            "",
+            "PDF Files (*.pdf);;All Files (*)"
+        )
+        
+        if file_path:
+            self.pdf_path = file_path
+            
+            try:
+                file_size = os.path.getsize(file_path) / (1024 * 1024)
+                file_name = os.path.basename(file_path)
+                self.pdf_info_label.setText(f"📄 {file_name} ({file_size:.1f} MB)")
+                self.pdf_info_label.setStyleSheet("color: #27ae60; font-weight: bold; padding: 10px;")
+            except:
+                self.pdf_info_label.setText(f"📄 {os.path.basename(file_path)}")
+            
+            self.detect_btn.setEnabled(True)
+            self.detected_tables = []
+            self.results_list.clear()
+            self.results_info_label.setText("PDF carregado. Configure as opções e clique em 'Iniciar Detecção'.")
+    
+    def start_detection(self):
+        """Inicia a detecção com o método selecionado"""
+        if not self.pdf_path:
+            QMessageBox.warning(self, "Aviso", "Selecione um PDF primeiro!")
+            return
+        
+        method = self.method_combo.currentText()
+        pages = self.pages_input.text().strip() or "all"
+        
+        # Configurar interface
+        self.detect_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.results_list.clear()
+        
+        # Escolher detector baseado no método
+        if "OpenCV" in method:
+            min_area = int(self.min_area_input.text() or "5000")
+            self.detector_thread = OpenCVTableDetector(self.pdf_path, pages, min_area)
+        elif "Tesseract" in method:
+            language = self.language_combo.currentText()
+            self.detector_thread = TesseractTableDetector(self.pdf_path, pages, language)
+        else:  # Híbrido
+            # Para método híbrido, vamos executar OpenCV primeiro
+            min_area = int(self.min_area_input.text() or "5000")
+            self.detector_thread = OpenCVTableDetector(self.pdf_path, pages, min_area)
+        
+        # Conectar sinais
+        self.detector_thread.progress_updated.connect(self.update_progress)
+        self.detector_thread.tables_detected.connect(self.on_tables_detected)
+        self.detector_thread.error_occurred.connect(self.on_detection_error)
+        self.detector_thread.start()
+    
+    def update_progress(self, progress, message):
+        """Atualiza progresso"""
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(message)
+    
+    def on_tables_detected(self, tables):
+        """Callback para tabelas detectadas"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        self.detected_tables = tables
+        
+        if not tables:
+            self.results_info_label.setText("❌ Nenhuma tabela detectada com este método")
+            return
+        
+        self.results_info_label.setText(f"✅ {len(tables)} tabela(s) detectada(s)")
+        
+        # Mostrar resultados na lista com informações detalhadas
+        for i, table in enumerate(tables):
+            method = table.get('detection_method', 'unknown')
+            confidence = table.get('confidence', 0.0)
+            
+            # Informações adicionais para validação
+            structure_score = table.get('structure_score', 0.0)
+            content_score = table.get('content_score', 0.0)
+            validation_passed = table.get('validation_passed', False)
+            
+            # Ícone baseado na confiança e validação
+            if validation_passed and confidence > 0.8:
+                conf_icon = "🟢"
+                status = "ALTA"
+            elif validation_passed and confidence > 0.6:
+                conf_icon = "🟡"
+                status = "MÉDIA"
+            elif validation_passed:
+                conf_icon = "🟠"
+                status = "BAIXA"
+            else:
+                conf_icon = "🔴"
+                status = "REJEITADA"
+            
+            # Texto detalhado para o item
+            item_text = (
+                f"{conf_icon} Página {table['page']} - "
+                f"Tabela {i+1} ({table.get('estimated_rows', '?')}x{table.get('estimated_cols', '?')}) - "
+                f"Método: {method.split('_')[0].upper()} - "
+                f"Qualidade: {status} ({confidence:.1%})"
+            )
+            
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, table)
+            
+            # Tooltip com informações detalhadas
+            tooltip_text = f"""
+🔍 Detalhes da Validação:
+📄 Página: {table['page']}
+📐 Posição: ({table['bbox'][0]}, {table['bbox'][1]})
+📏 Dimensões: {table['bbox'][2]} x {table['bbox'][3]} px
+🎯 Método: {method}
+⭐ Confiança Final: {confidence:.1%}
+"""
+            
+            if 'structure_score' in table:
+                tooltip_text += f"🏗️ Score Estrutural: {structure_score:.1%}\n"
+            if 'content_score' in table:
+                tooltip_text += f"📝 Score de Conteúdo: {content_score:.1%}\n"
+            if 'column_consistency' in table:
+                tooltip_text += f"📊 Consistência Colunas: {table['column_consistency']:.1%}\n"
+            if 'word_count' in table:
+                tooltip_text += f"🔤 Palavras Detectadas: {table['word_count']}\n"
+            
+            tooltip_text += f"✅ Validação: {'APROVADA' if validation_passed else 'REJEITADA'}"
+            
+            item.setToolTip(tooltip_text)
+            self.results_list.addItem(item)
+        
+        self.export_btn.setEnabled(True)
+        
+        QMessageBox.information(
+            self,
+            "Detecção Concluída",
+            f"🎉 {len(tables)} tabela(s) detectada(s)!\n\n"
+            "Selecione as tabelas desejadas e clique em 'Exportar' para salvá-las."
+        )
+    
+    def on_detection_error(self, error_message):
+        """Callback para erros"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        self.results_info_label.setText("❌ Erro na detecção")
+        QMessageBox.critical(self, "Erro na Detecção", error_message)
+    
+    def on_selection_changed(self):
+        """Atualiza interface quando seleção muda"""
+        selected = self.results_list.selectedItems()
+        self.preview_btn.setEnabled(len(selected) == 1)
+    
+    def preview_selected(self):
+        """Mostra preview da tabela selecionada"""
+        selected = self.results_list.selectedItems()
+        if not selected:
+            return
+        
+        table_data = selected[0].data(Qt.UserRole)
+        bbox = table_data['bbox']
+        page = table_data['page']
+        
+        info_text = f"""
+        📄 Página: {page}
+        📐 Posição: ({bbox[0]}, {bbox[1]})
+        📏 Dimensões: {bbox[2]} x {bbox[3]} pixels
+        🔍 Método: {table_data.get('detection_method', 'N/A')}
+        📊 Linhas estimadas: {table_data.get('estimated_rows', 'N/A')}
+        📋 Colunas estimadas: {table_data.get('estimated_cols', 'N/A')}
+        ⭐ Confiança: {table_data.get('confidence', 0):.1%}
+        """
+        
+        QMessageBox.information(self, "Informações da Tabela", info_text)
+    
+    def export_tables(self):
+        """Exporta tabelas selecionadas"""
+        selected_items = self.results_list.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Aviso", "Selecione ao menos uma tabela!")
+            return
+        
+        # Escolher pasta
+        out_dir = QFileDialog.getExistingDirectory(self, 'Escolher pasta para salvar tabelas')
+        if not out_dir:
+            return
+        
+        # Criar subpasta
+        detection_dir = os.path.join(out_dir, 'tabelas_detectadas')
+        os.makedirs(detection_dir, exist_ok=True)
+        
+        try:
+            doc = fitz.open(self.pdf_path)
+            pdf_base = os.path.splitext(os.path.basename(self.pdf_path))[0]
+            saved_count = 0
+            jsonl_data = []
+            
+            for item in selected_items:
+                table_data = item.data(Qt.UserRole)
+                page_num = table_data['page']
+                bbox = table_data['bbox']
+                
+                # Extrair região da tabela
+                page = doc.load_page(page_num - 1)
+                rect = fitz.Rect(bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
+                pix = page.get_pixmap(clip=rect, dpi=150)
+                
+                # Converter e salvar
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+                
+                method_name = table_data.get('detection_method', 'auto').split('_')[0]
+                table_name = f'{pdf_base}_pag{page_num}_tab{saved_count+1}_{method_name}.png'
+                img_path = os.path.join(detection_dir, table_name)
+                img.save(img_path)
+                
+                # Dados JSONL
+                jsonl_entry = {
+                    "type": "table",
+                    "source": pdf_base,
+                    "page": page_num,
+                    "table_number": saved_count + 1,
+                    "title": f"Tabela Detectada - {method_name.upper()}",
+                    "image_file": table_name,
+                    "extraction_date": datetime.datetime.now().isoformat(),
+                    "detection_method": table_data.get('detection_method', 'unknown'),
+                    "bbox": bbox,
+                    "estimated_dimensions": f"{table_data.get('estimated_rows', '?')}x{table_data.get('estimated_cols', '?')}",
+                    "confidence": table_data.get('confidence', 0.0),
+                    "text": [],
+                    "metadata": {
+                        "conversion_method": "automatic_detection",
+                        "requires_manual_review": table_data.get('confidence', 0) < 0.7,
+                        "confidence_level": "high" if table_data.get('confidence', 0) > 0.8 else "medium" if table_data.get('confidence', 0) > 0.5 else "low"
+                    }
+                }
+                jsonl_data.append(jsonl_entry)
+                saved_count += 1
+            
+            doc.close()
+            
+            # Salvar JSONL
+            jsonl_file = os.path.join(detection_dir, f'{pdf_base}_deteccao_automatica.jsonl')
+            with open(jsonl_file, 'w', encoding='utf-8') as f:
+                for entry in jsonl_data:
+                    json.dump(entry, f, ensure_ascii=False)
+                    f.write('\n')
+            
+            QMessageBox.information(
+                self,
+                "Exportação Concluída",
+                f"🎉 {saved_count} tabela(s) exportada(s)!\n\n"
+                f"📁 Pasta: {detection_dir}\n"
+                f"🖼️ Imagens: {saved_count} arquivos PNG\n"
+                f"📄 Dados: {os.path.basename(jsonl_file)}"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao exportar: {str(e)}")
+
+
+class CamelotPDFAnalyzer(QWidget):
+    """Aba dedicada para análise de PDF com Camelot - sem renderização de imagens"""
+    
+    def __init__(self):
+        super().__init__()
+        self.pdf_path = None
+        self.detector_thread = None
+        self.detected_tables = []
+        self.init_ui()
+    
+    def init_ui(self):
+        """Inicializa a interface da aba Camelot"""
+        layout = QVBoxLayout(self)
+        
+        # Título principal
+        title = QLabel("🔍 Camelot - Detecção Automática de Tabelas")
+        title.setFont(QFont("Arial", 18, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #2c3e50; margin: 15px; padding: 10px;")
+        layout.addWidget(title)
+        
+        # Seção de seleção de arquivo
+        file_section = QGroupBox("📁 Selecionar PDF")
+        file_layout = QVBoxLayout(file_section)
+        
+        # Botão de seleção e info do arquivo
+        file_controls = QHBoxLayout()
+        
+        self.select_pdf_btn = QPushButton("📂 Escolher PDF para Análise")
+        self.select_pdf_btn.clicked.connect(self.select_pdf)
+        self.select_pdf_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                font-weight: bold;
+                padding: 15px 30px;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        
+        self.pdf_info_label = QLabel("Nenhum PDF selecionado")
+        self.pdf_info_label.setStyleSheet("color: #7f8c8d; font-style: italic; padding: 10px;")
+        
+        file_controls.addWidget(self.select_pdf_btn)
+        file_controls.addWidget(self.pdf_info_label)
+        file_controls.addStretch()
+        
+        file_layout.addLayout(file_controls)
+        layout.addWidget(file_section)
+        
+        # Seção de configurações
+        config_section = QGroupBox("⚙️ Configurações de Detecção")
+        config_layout = QFormLayout(config_section)
+        
+        # Método de detecção
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["stream", "lattice"])
+        self.method_combo.setCurrentText("stream")
+        self.method_combo.setToolTip(
+            "stream: Para tabelas sem bordas (texto alinhado)\n"
+            "lattice: Para tabelas com bordas definidas"
+        )
+        config_layout.addRow("Método de Detecção:", self.method_combo)
+        
+        # Páginas a processar
+        self.pages_input = QLineEdit()
+        self.pages_input.setPlaceholderText("Ex: 1,3,5-10 ou deixe vazio para todas as páginas")
+        self.pages_input.setToolTip("Especifique páginas específicas ou deixe vazio para analisar todo o PDF")
+        config_layout.addRow("Páginas:", self.pages_input)
+        
+        # Configurações avançadas
+        advanced_layout = QHBoxLayout()
+        
+        self.edge_tol_input = QLineEdit("50")
+        self.edge_tol_input.setPlaceholderText("50")
+        self.edge_tol_input.setMaximumWidth(80)
+        advanced_layout.addWidget(QLabel("Tolerância de Borda:"))
+        advanced_layout.addWidget(self.edge_tol_input)
+        
+        self.row_tol_input = QLineEdit("2")
+        self.row_tol_input.setPlaceholderText("2")
+        self.row_tol_input.setMaximumWidth(80)
+        advanced_layout.addWidget(QLabel("Tolerância de Linha:"))
+        advanced_layout.addWidget(self.row_tol_input)
+        
+        advanced_layout.addStretch()
+        config_layout.addRow("Avançado:", advanced_layout)
+        
+        layout.addWidget(config_section)
+        
+        # Botões de ação
+        action_layout = QHBoxLayout()
+        
+        self.detect_btn = QPushButton("🚀 Detectar Tabelas")
+        self.detect_btn.clicked.connect(self.start_detection)
+        self.detect_btn.setEnabled(False)
+        self.detect_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e67e22;
+                color: white;
+                font-weight: bold;
+                padding: 12px 25px;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #d35400;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+        """)
+        
+        self.preview_btn = QPushButton("👁️ Visualizar Tabela")
+        self.preview_btn.clicked.connect(self.preview_selected_table)
+        self.preview_btn.setEnabled(False)
+        
+        self.export_selected_btn = QPushButton("💾 Exportar Selecionadas")
+        self.export_selected_btn.clicked.connect(self.export_selected_tables)
+        self.export_selected_btn.setEnabled(False)
+        
+        self.export_all_btn = QPushButton("📥 Exportar Todas")
+        self.export_all_btn.clicked.connect(self.export_all_tables)
+        self.export_all_btn.setEnabled(False)
+        
+        action_layout.addWidget(self.detect_btn)
+        action_layout.addWidget(self.preview_btn)
+        action_layout.addWidget(self.export_selected_btn)
+        action_layout.addWidget(self.export_all_btn)
+        action_layout.addStretch()
+        
+        layout.addLayout(action_layout)
+        
+        # Progresso
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_label = QLabel("")
+        self.progress_label.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.progress_label)
+        
+        # Lista de tabelas detectadas
+        tables_section = QGroupBox("📋 Tabelas Detectadas")
+        tables_layout = QVBoxLayout(tables_section)
+        
+        # Informações das tabelas
+        self.tables_info_label = QLabel("Nenhuma tabela detectada ainda")
+        self.tables_info_label.setAlignment(Qt.AlignCenter)
+        self.tables_info_label.setStyleSheet("color: #7f8c8d; font-style: italic; padding: 10px;")
+        tables_layout.addWidget(self.tables_info_label)
+        
+        # Lista de tabelas
+        self.tables_list = QListWidget()
+        self.tables_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.tables_list.itemSelectionChanged.connect(self.on_table_selection_changed)
+        tables_layout.addWidget(self.tables_list)
+        
+        # Preview da tabela selecionada
+        self.table_preview = QTextEdit()
+        self.table_preview.setMaximumHeight(200)
+        self.table_preview.setPlaceholderText("Selecione uma tabela para ver o preview...")
+        self.table_preview.setReadOnly(True)
+        self.table_preview.setFont(QFont("Consolas", 9))
+        tables_layout.addWidget(QLabel("Preview da Tabela Selecionada:"))
+        tables_layout.addWidget(self.table_preview)
+        
+        layout.addWidget(tables_section)
+        
+        # Instruções
+        instructions = QLabel("""
+        <b>🔧 Como usar o Camelot:</b><br>
+        <b>1.</b> Selecione um PDF que contenha <u>texto real</u> (não imagens de texto)<br>
+        <b>2.</b> Escolha o método adequado:<br>
+        &nbsp;&nbsp;&nbsp;• <b>stream</b>: Tabelas sem bordas, texto alinhado em colunas<br>
+        &nbsp;&nbsp;&nbsp;• <b>lattice</b>: Tabelas com bordas e linhas visíveis<br>
+        <b>3.</b> Especifique páginas específicas ou deixe vazio para todas<br>
+        <b>4.</b> Clique em "Detectar Tabelas" e aguarde<br>
+        <b>5.</b> Selecione as tabelas desejadas e exporte<br><br>
+        <b>⚠️ Importante:</b> O Camelot funciona melhor com PDFs que contêm texto selecionável, não imagens escaneadas.
+        """)
+        instructions.setStyleSheet("""
+            background-color: #e8f4fd; 
+            padding: 15px; 
+            border-radius: 8px; 
+            color: #2c3e50;
+            border: 1px solid #3498db;
+        """)
+        layout.addWidget(instructions)
+    
+    def select_pdf(self):
+        """Seleciona um PDF para análise"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar PDF para Análise com Camelot",
+            "",
+            "PDF Files (*.pdf);;All Files (*)"
+        )
+        
+        if file_path:
+            self.pdf_path = file_path
+            
+            # Atualizar informações do PDF
+            try:
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                file_name = os.path.basename(file_path)
+                self.pdf_info_label.setText(f"📄 {file_name} ({file_size:.1f} MB)")
+                self.pdf_info_label.setStyleSheet("color: #27ae60; font-weight: bold; padding: 10px;")
+            except:
+                self.pdf_info_label.setText(f"📄 {os.path.basename(file_path)}")
+            
+            # Habilitar detecção
+            self.detect_btn.setEnabled(True)
+            
+            # Limpar dados anteriores
+            self.detected_tables = []
+            self.tables_list.clear()
+            self.table_preview.clear()
+            self.tables_info_label.setText("PDF carregado. Clique em 'Detectar Tabelas' para começar.")
+            self.export_selected_btn.setEnabled(False)
+            self.export_all_btn.setEnabled(False)
+            self.preview_btn.setEnabled(False)
+    
+    def start_detection(self):
+        """Inicia a detecção de tabelas"""
+        if not self.pdf_path:
+            QMessageBox.warning(self, "Aviso", "Selecione um PDF primeiro!")
+            return
+        
+        # Obter configurações
+        method = self.method_combo.currentText()
+        pages = self.pages_input.text().strip() or "all"
+        
+        # Configurar interface
+        self.detect_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.tables_list.clear()
+        self.table_preview.clear()
+        
+        # Iniciar thread de detecção
+        self.detector_thread = CamelotTableDetector(self.pdf_path, pages, method)
+        self.detector_thread.progress_updated.connect(self.update_progress)
+        self.detector_thread.tables_detected.connect(self.on_tables_detected)
+        self.detector_thread.error_occurred.connect(self.on_detection_error)
+        self.detector_thread.pdf_type_detected.connect(self.on_pdf_type_detected)
+        self.detector_thread.start()
+    
+    def update_progress(self, progress, message):
+        """Atualiza o progresso"""
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(message)
+    
+    def on_tables_detected(self, tables):
+        """Callback quando tabelas são detectadas"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        self.detected_tables = tables
+        
+        if not tables:
+            self.tables_info_label.setText("❌ Nenhuma tabela detectada. Tente outro método ou verifique se o PDF contém texto selecionável.")
+            return
+        
+        # Atualizar info
+        self.tables_info_label.setText(f"✅ {len(tables)} tabela(s) detectada(s)")
+        
+        # Exibir tabelas na lista
+        for i, table in enumerate(tables):
+            accuracy = table.get('accuracy', 0.0)
+            accuracy_icon = "🟢" if accuracy > 0.8 else "🟡" if accuracy > 0.5 else "🔴"
+            
+            item_text = (
+                f"{accuracy_icon} Página {table['page']} - Tabela {i+1} "
+                f"({table['shape'][0]}x{table['shape'][1]}) - "
+                f"Precisão: {accuracy:.1%}"
+            )
+            
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, table)
+            
+            # Adicionar preview como tooltip
+            if table.get('preview'):
+                item.setToolTip(f"Preview:\n{table['preview']}")
+            
+            self.tables_list.addItem(item)
+        
+        # Habilitar botões
+        self.export_all_btn.setEnabled(True)
+        
+        QMessageBox.information(
+            self,
+            "Detecção Concluída",
+            f"🎉 {len(tables)} tabela(s) detectada(s)!\n\n"
+            "Selecione as tabelas desejadas na lista para ver o preview "
+            "e clique em 'Exportar' para salvar."
+        )
+    
+    def on_detection_error(self, error_message):
+        """Callback quando ocorre erro"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        self.tables_info_label.setText("❌ Erro na detecção")
+        QMessageBox.critical(self, "Erro na Detecção", f"Erro ao detectar tabelas:\n\n{error_message}")
+    
+    def on_pdf_type_detected(self, pdf_type, has_text):
+        """Callback para informação sobre o tipo de PDF"""
+        if has_text:
+            self.tables_info_label.setText(f"✅ PDF com texto detectado - Compatível com Camelot")
+        else:
+            self.tables_info_label.setText(f"⚠️ PDF baseado em imagens - Use outras abas para extração")
+    
+    def on_table_selection_changed(self):
+        """Atualiza preview quando seleção muda"""
+        selected_items = self.tables_list.selectedItems()
+        
+        if selected_items:
+            self.export_selected_btn.setEnabled(True)
+            self.preview_btn.setEnabled(True)
+            
+            # Mostrar preview da primeira tabela selecionada
+            if len(selected_items) == 1:
+                table_data = selected_items[0].data(Qt.UserRole)
+                preview_text = table_data.get('preview', 'Preview não disponível')
+                self.table_preview.setPlainText(preview_text)
+            else:
+                self.table_preview.setPlainText(f"{len(selected_items)} tabelas selecionadas")
+        else:
+            self.export_selected_btn.setEnabled(False)
+            self.preview_btn.setEnabled(False)
+            self.table_preview.clear()
+    
+    def preview_selected_table(self):
+        """Mostra preview detalhado da tabela selecionada"""
+        selected_items = self.tables_list.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Aviso", "Selecione uma tabela primeiro!")
+            return
+        
+        if len(selected_items) > 1:
+            QMessageBox.warning(self, "Aviso", "Selecione apenas uma tabela para preview!")
+            return
+        
+        table_data = selected_items[0].data(Qt.UserRole)
+        
+        # Criar janela de preview
+        preview_dialog = QMessageBox(self)
+        preview_dialog.setWindowTitle("Preview da Tabela")
+        preview_dialog.setText(f"Tabela da Página {table_data['page']} - {table_data['shape'][0]}x{table_data['shape'][1]} células")
+        preview_dialog.setDetailedText(table_data.get('preview', 'Preview não disponível'))
+        preview_dialog.exec_()
+    
+    def export_selected_tables(self):
+        """Exporta as tabelas selecionadas"""
+        selected_items = self.tables_list.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Aviso", "Selecione ao menos uma tabela!")
+            return
+        
+        selected_tables = [item.data(Qt.UserRole) for item in selected_items]
+        self._export_tables(selected_tables)
+    
+    def export_all_tables(self):
+        """Exporta todas as tabelas detectadas"""
+        if not self.detected_tables:
+            QMessageBox.warning(self, "Aviso", "Nenhuma tabela detectada!")
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Confirmar Exportação",
+            f"Deseja exportar todas as {len(self.detected_tables)} tabelas detectadas?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self._export_tables(self.detected_tables)
+    
+    def _export_tables(self, tables_to_export):
+        """Exporta as tabelas especificadas"""
+        # Escolher pasta para salvar
+        out_dir = QFileDialog.getExistingDirectory(self, 'Escolher pasta para salvar tabelas Camelot')
+        if not out_dir:
+            return
+        
+        # Criar pasta 'tabelas_camelot' se não existir
+        tabelas_dir = os.path.join(out_dir, 'tabelas_camelot')
+        os.makedirs(tabelas_dir, exist_ok=True)
+        
+        pdf_base = os.path.splitext(os.path.basename(self.pdf_path))[0]
+        saved_count = 0
+        jsonl_data = []
+        
+        try:
+            # Abrir PDF para extrair as imagens das tabelas
+            doc = fitz.open(self.pdf_path)
+            
+            for table in tables_to_export:
+                page_num = table['page']
+                bbox = table['bbox']  # (x1, y1, x2, y2)
+                table_index = table['index']
+                
+                # Carregar página
+                page = doc.load_page(page_num - 1)  # Camelot usa 1-based, fitz usa 0-based
+                
+                # Extrair região da tabela
+                # Converter de (x, y, width, height) para (x1, y1, x2, y2)
+                rect = fitz.Rect(bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
+                pix = page.get_pixmap(clip=rect, dpi=150)
+                
+                # Converter para QImage
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+                
+                # Salvar imagem
+                table_name = f'{pdf_base}_pag{page_num}_tab{table_index}_camelot.png'
+                img_path = os.path.join(tabelas_dir, table_name)
+                img.save(img_path)
+                
+                # Criar dados JSONL
+                jsonl_entry = {
+                    "type": "table",
+                    "source": pdf_base,
+                    "page": page_num,
+                    "table_number": table_index,
+                    "title": f"Tabela Camelot - Página {page_num}, Tabela {table_index}",
+                    "image_file": table_name,
+                    "extraction_date": datetime.datetime.now().isoformat(),
+                    "detection_method": "camelot",
+                    "bbox": bbox,
+                    "shape": table['shape'],
+                    "accuracy": table.get('accuracy', 0.0),
+                    "text": table.get('data', []),
+                    "metadata": {
+                        "conversion_method": "camelot_automatic",
+                        "requires_manual_review": table.get('accuracy', 0) < 0.8,
+                        "confidence": "high" if table.get('accuracy', 0) > 0.8 else "medium" if table.get('accuracy', 0) > 0.5 else "low"
+                    }
+                }
+                jsonl_data.append(jsonl_entry)
+                saved_count += 1
+            
+            doc.close()
+            
+            # Salvar arquivo JSONL consolidado
+            jsonl_file = os.path.join(tabelas_dir, f'{pdf_base}_tabelas_camelot.jsonl')
+            with open(jsonl_file, 'w', encoding='utf-8') as f:
+                for entry in jsonl_data:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            
+            QMessageBox.information(
+                self,
+                "Exportação Concluída",
+                f"🎉 {saved_count} tabela(s) exportada(s) com sucesso!\n\n"
+                f"📁 Pasta: {tabelas_dir}\n"
+                f"🖼️ Imagens: {saved_count} arquivos PNG\n"
+                f"📄 Dados: {os.path.basename(jsonl_file)}\n\n"
+                f"💡 Use a aba 'Visualizar Tabelas' para revisar os resultados!"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao exportar tabelas:\n{str(e)}")
+
+
+class CamelotTableDetectorWidget(QWidget):
+    """Widget para detecção automática de tabelas usando Camelot"""
+    
+    tables_selected = pyqtSignal(list)  # Signal emitido quando tabelas são selecionadas
+    
+    def __init__(self):
+        super().__init__()
+        self.detector_thread = None
+        self.pdf_path = None
+        self.detected_tables = []
+        self.init_ui()
+    
+    def init_ui(self):
+        """Inicializa a interface"""
+        layout = QVBoxLayout(self)
+        
+        # Título
+        title = QLabel("🔍 Detecção Automática de Tabelas")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #2c3e50; margin: 10px;")
+        layout.addWidget(title)
+        
+        # Configurações
+        config_group = QGroupBox("Configurações de Detecção")
+        config_layout = QFormLayout(config_group)
+        
+        # Método de detecção
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["stream", "lattice"])
+        self.method_combo.setCurrentText("stream")
+        config_layout.addRow("Método:", self.method_combo)
+        
+        # Páginas a processar
+        self.pages_input = QLineEdit()
+        self.pages_input.setPlaceholderText("Ex: 1,3,5-10 ou deixe vazio para todas")
+        config_layout.addRow("Páginas:", self.pages_input)
+        
+        layout.addWidget(config_group)
+        
+        # Botões
+        buttons_layout = QHBoxLayout()
+        
+        self.detect_btn = QPushButton("🚀 Detectar Tabelas")
+        self.detect_btn.clicked.connect(self.start_detection)
+        self.detect_btn.setEnabled(False)
+        self.detect_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e67e22;
+                color: white;
+                font-weight: bold;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #d35400;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+        """)
+        
+        self.select_all_btn = QPushButton("✅ Selecionar Todas")
+        self.select_all_btn.clicked.connect(self.select_all_tables)
+        self.select_all_btn.setEnabled(False)
+        
+        self.export_btn = QPushButton("💾 Exportar Selecionadas")
+        self.export_btn.clicked.connect(self.export_selected_tables)
+        self.export_btn.setEnabled(False)
+        
+        buttons_layout.addWidget(self.detect_btn)
+        buttons_layout.addWidget(self.select_all_btn)
+        buttons_layout.addWidget(self.export_btn)
+        buttons_layout.addStretch()
+        
+        layout.addLayout(buttons_layout)
+        
+        # Progresso
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_label = QLabel("")
+        self.progress_label.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.progress_label)
+        
+        # Lista de tabelas detectadas
+        self.tables_list = QListWidget()
+        self.tables_list.setSelectionMode(QListWidget.ExtendedSelection)
+        layout.addWidget(QLabel("Tabelas Detectadas:"))
+        layout.addWidget(self.tables_list)
+        
+        # Instruções
+        instructions = QLabel("""
+        <b>Como usar:</b><br>
+        1. Selecione um PDF primeiro na área principal<br>
+        2. Escolha o método: "stream" para texto alinhado, "lattice" para tabelas com bordas<br>
+        3. Especifique páginas (opcional) ou deixe vazio para todas<br>
+        4. Clique em "Detectar Tabelas"<br>
+        5. Selecione as tabelas desejadas na lista<br>
+        6. Clique em "Exportar Selecionadas" para extrair as tabelas
+        """)
+        instructions.setStyleSheet("background-color: #e8f4fd; padding: 10px; border-radius: 5px; color: #2c3e50;")
+        layout.addWidget(instructions)
+    
+    def set_pdf_path(self, pdf_path):
+        """Define o caminho do PDF"""
+        self.pdf_path = pdf_path
+        self.detect_btn.setEnabled(True)
+        self.tables_list.clear()
+        self.detected_tables = []
+        self.select_all_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+    
+    def start_detection(self):
+        """Inicia a detecção de tabelas"""
+        if not self.pdf_path:
+            QMessageBox.warning(self, "Aviso", "Nenhum PDF selecionado!")
+            return
+        
+        method = self.method_combo.currentText()
+        pages = self.pages_input.text().strip() or "all"
+        
+        # Configurar interface
+        self.detect_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.tables_list.clear()
+        
+        # Iniciar thread de detecção
+        self.detector_thread = CamelotTableDetector(self.pdf_path, pages, method)
+        self.detector_thread.progress_updated.connect(self.update_progress)
+        self.detector_thread.tables_detected.connect(self.on_tables_detected)
+        self.detector_thread.error_occurred.connect(self.on_detection_error)
+        self.detector_thread.start()
+    
+    def update_progress(self, progress, message):
+        """Atualiza o progresso"""
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(message)
+    
+    def on_tables_detected(self, tables):
+        """Callback quando tabelas são detectadas"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        self.detected_tables = tables
+        
+        # Exibir tabelas na lista
+        for table in tables:
+            item_text = (
+                f"Página {table['page']} - Tabela {table['index']} "
+                f"({table['shape'][0]}x{table['shape'][1]} células)"
+            )
+            
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, table)  # Armazenar dados da tabela
+            
+            # Adicionar preview como tooltip
+            if table['preview']:
+                item.setToolTip(f"Preview:\n{table['preview']}")
+            
+            self.tables_list.addItem(item)
+        
+        self.select_all_btn.setEnabled(len(tables) > 0)
+        self.export_btn.setEnabled(len(tables) > 0)
+        
+        QMessageBox.information(
+            self,
+            "Detecção Concluída",
+            f"✅ {len(tables)} tabelas detectadas!\n\n"
+            "Selecione as tabelas desejadas na lista e clique em 'Exportar Selecionadas'."
+        )
+    
+    def on_detection_error(self, error_message):
+        """Callback quando ocorre erro"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.detect_btn.setEnabled(True)
+        
+        QMessageBox.critical(self, "Erro na Detecção", error_message)
+    
+    def select_all_tables(self):
+        """Seleciona todas as tabelas da lista"""
+        for i in range(self.tables_list.count()):
+            self.tables_list.item(i).setSelected(True)
+    
+    def export_selected_tables(self):
+        """Exporta as tabelas selecionadas"""
+        selected_items = self.tables_list.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Aviso", "Selecione ao menos uma tabela!")
+            return
+        
+        # Coletar dados das tabelas selecionadas
+        selected_tables = []
+        for item in selected_items:
+            table_data = item.data(Qt.UserRole)
+            selected_tables.append(table_data)
+        
+        # Emitir signal para a classe principal processar
+        self.tables_selected.emit(selected_tables)
 
 
 class PDFPageLabel(QLabel):
@@ -1103,7 +2340,7 @@ class PDFTableExtractor(QWidget):
         extraction_layout.addWidget(self.progress_bar)
         extraction_layout.addWidget(self.progress_label)
 
-        # Área de scroll para o PDF
+        # Área de scroll para o PDF (apenas seleção manual)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll_content = QFrame()
@@ -1111,25 +2348,32 @@ class PDFTableExtractor(QWidget):
         self.scroll.setWidget(self.scroll_content)
         extraction_layout.addWidget(self.scroll)
         
-        # Instruções
-        instructions = QLabel("""
-        <b>Como usar:</b><br>
-        1. Clique em "Escolher PDF" para selecionar um arquivo<br>
-        2. Aguarde o carregamento progressivo por lotes<br>
-        3. Clique em dois pontos para selecionar uma tabela (mesmo página ou entre páginas)<br>
-        4. Clique em "Salvar Tabelas Selecionadas" para extrair as imagens<br>
-        5. Use a aba "Visualizar Tabelas" para converter para JSONL
+        # Instruções para seleção manual
+        manual_instructions = QLabel("""
+        <b>Como usar a Seleção Manual:</b><br>
+        • Aguarde o carregamento completo do PDF<br>
+        • Clique em dois pontos para selecionar uma tabela (mesmo página ou entre páginas)<br>
+        • Use "Salvar Tabelas Selecionadas" para extrair as imagens<br>
+        • Para detecção automática, use a aba "🔍 Camelot"
         """)
-        instructions.setStyleSheet("background-color: #ecf0f1; padding: 10px; border-radius: 5px;")
-        extraction_layout.addWidget(instructions)
+        manual_instructions.setStyleSheet("background-color: #e8f6f3; padding: 10px; border-radius: 5px; color: #2c3e50;")
+        extraction_layout.addWidget(manual_instructions)
         
-        self.tabs.addTab(extraction_tab, "📄 Extração de PDF")
+        self.tabs.addTab(extraction_tab, "📄 Seleção Manual")
         
-        # Tab 2: Visualizador de tabelas
+        # Tab 2: Camelot - Detecção Automática
+        self.camelot_analyzer = CamelotPDFAnalyzer()
+        self.tabs.addTab(self.camelot_analyzer, "� Camelot")
+        
+        # Tab 3: Visualizador de tabelas
         self.image_viewer = ImageViewer()
         self.tabs.addTab(self.image_viewer, "🖼️ Visualizar Tabelas")
         
-        # Tab 3: Extração com IA
+        # Tab 4: Detecção Avançada
+        self.advanced_detector = AdvancedTableDetector()
+        self.tabs.addTab(self.advanced_detector, "🔬 Detecção Avançada")
+        
+        # Tab 5: Extração com IA
         self.ai_extractor = AITableExtractorWidget()
         self.tabs.addTab(self.ai_extractor, "🤖 IA - Extração Automática")
         
