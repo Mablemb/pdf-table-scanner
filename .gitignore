@@ -238,3 +238,7 @@ test_write_permission.tmp
 build/
 dist/
 *.spec
+clean_project.py
+documentation_update_summary.py
+project_structure.py
+show_results.py
