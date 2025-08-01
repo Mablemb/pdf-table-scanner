@@ -146,7 +146,7 @@ class OpenCVTableDetector(QThread):
             if h_cont >= min_v_length and w_cont <= 15:  # Linha fina e alta
                 valid_v_lines += 1
         
-        # Critérios muito mais permissivos
+        # Critérios ultra permissivos para tabelas pequenas
         has_enough_lines = valid_h_lines >= 1 or valid_v_lines >= 1  # Pelo menos 1 linha em qualquer direção
         
         # Verificar densidade de intersecções
@@ -159,27 +159,31 @@ class OpenCVTableDetector(QThread):
         region_area = w * h
         area_ratio = region_area / image_area
         
-        # Validações muito permissivas
-        valid_area = 0.001 <= area_ratio <= 0.95  # Reduzido para 0.1%
-        valid_aspect = 0.5 <= (w/h) <= 50  # Expandido ainda mais
+        # Validações ultra permissivas para tabelas pequenas
+        valid_area = 0.0005 <= area_ratio <= 0.98  # Reduzido para 0.05% 
+        valid_aspect = 0.2 <= (w/h) <= 100  # Expandido ainda mais para tabelas estreitas/largas
         valid_intersections = intersection_density >= 0  # Aceitar qualquer valor
         
-        # Score de confiança (mais generoso)
+        # Score de confiança ultra generoso
         confidence = 0.0
         if has_enough_lines:
-            confidence += 0.5  # Aumentado
+            confidence += 0.6  # Aumentado significativamente
         if valid_intersections or intersection_density > 0:
             confidence += 0.2
         if valid_area:
-            confidence += 0.2
+            confidence += 0.15
         if valid_aspect:
-            confidence += 0.1
+            confidence += 0.05
+        
+        # Bonus especial para tabelas pequenas
+        if region_area < 10000:  # Tabela pequena
+            confidence += 0.1  # Bonus extra
         
         # Bonus para muitas linhas
         if valid_h_lines >= 2 and valid_v_lines >= 1:
-            confidence += 0.2
+            confidence += 0.1
         
-        return confidence >= 0.2, confidence  # Reduzido para 20%
+        return confidence >= 0.15, confidence  # Reduzido para 15% (ultra permissivo)
     
     def analyze_table_content(self, image, bbox):
         """Analisa o conteúdo da região para determinar se é realmente uma tabela"""
@@ -283,22 +287,23 @@ class OpenCVTableDetector(QThread):
         # Encontrar contornos
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Filtrar contornos com critérios mais rigorosos
+        # Filtrar contornos com critérios ultra permissivos para tabelas pequenas
         table_contours = []
         
         for contour in contours:
             area = cv2.contourArea(contour)
             
-            # Área mínima mais restritiva
-            if area < self.min_table_area:
+            # Área mínima dinâmica (muito mais baixa para detectar tabelas pequenas)
+            dynamic_min_area = max(100, self.min_table_area // 10)  # Reduzir drasticamente o mínimo
+            if area < dynamic_min_area:
                 continue
             
             # Aproximar contorno para retângulo
             epsilon = 0.02 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
             
-            # Deve ter formato retangular
-            if len(approx) < 4:
+            # Ser mais permissivo com formato (não exigir exatamente 4 lados)
+            if len(approx) < 3:  # Reduzido de 4 para 3
                 continue
             
             x, y, w, h = cv2.boundingRect(contour)

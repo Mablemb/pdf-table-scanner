@@ -213,6 +213,17 @@ tabelas/*.png
 !tabelas/Manual-BLS_pagina_1_tabela_1.png
 !tabelas/Manual-BLS_pagina_1-2_tabela_2.png
 
+# Resultados de detecção automática
+analise_paginas_*_*/
+deteccao_aprimorada_*/
+focused_comparison_*/
+*.json
+*.jsonl
+
+# Arquivos PDF do projeto (manter apenas exemplos)
+*.pdf
+!Medicina_de_emergencia_abordagem_pratica_regioes_extraidas_20250731_144418.pdf
+
 # Arquivos temporários de teste
 test_write_permission.tmp
 *.tmp

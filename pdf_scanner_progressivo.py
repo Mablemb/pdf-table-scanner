@@ -24,10 +24,16 @@ import subprocess
 import base64
 import camelot
 import pandas as pd
-import datetime
-import openai
 from opencv_table_detector import OpenCVTableDetector, TesseractTableDetector
 from multi_pass_detector import MultiPassTableDetector
+
+# Import condicional do OpenAI (opcional)
+try:
+    import openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+    print("⚠️ OpenAI não instalado - funcionalidade de IA limitada")
 
 
 class PDFLoaderThread(QThread):
@@ -189,40 +195,22 @@ class CamelotTableDetector(QThread):
                 )
                 return
             
-            self.progress_updated.emit(15, f"PDF com texto detectado. Iniciando detecção...")
-            
-            # Detectar tabelas com Camelot
-            if self.pages == "all":
-                tables = camelot.read_pdf(self.pdf_path, flavor=self.method)
+            # Definir mensagem baseada no método
+            if self.method == "hybrid":
+                method_msg = "Sistema Híbrido Camelot v3.0"
             else:
-                tables = camelot.read_pdf(self.pdf_path, pages=str(self.pages), flavor=self.method)
+                method_msg = f"método {self.method}"
+            
+            self.progress_updated.emit(15, f"PDF com texto detectado ({total_pages} páginas). Iniciando {method_msg}...")
+            
+            # Detectar tabelas com sistema apropriado
+            if self.pages == "all":
+                detected_tables = self.process_all_pages_in_batches(total_pages)
+            else:
+                detected_tables = self.process_specific_pages(self.pages)
             
             if self.should_stop:
                 return
-            
-            self.progress_updated.emit(50, f"Processando {len(tables)} tabelas encontradas...")
-            
-            # Processar resultados
-            detected_tables = []
-            for i, table in enumerate(tables):
-                if self.should_stop:
-                    break
-                
-                # Informações da tabela
-                table_info = {
-                    "index": i,
-                    "page": int(table.page),
-                    "bbox": table._bbox,  # (x1, y1, x2, y2)
-                    "accuracy": table.accuracy if hasattr(table, 'accuracy') else 0.0,
-                    "shape": table.shape,
-                    "data": table.df.to_dict('records') if len(table.df) > 0 else [],
-                    "preview": table.df.head(3).to_string() if len(table.df) > 0 else "Tabela vazia"
-                }
-                detected_tables.append(table_info)
-                
-                # Atualizar progresso
-                progress = 50 + int((i / len(tables)) * 40)
-                self.progress_updated.emit(progress, f"Processando tabela {i+1}/{len(tables)}")
             
             self.progress_updated.emit(100, f"Detecção concluída! {len(detected_tables)} tabelas encontradas")
             self.tables_detected.emit(detected_tables)
@@ -230,9 +218,347 @@ class CamelotTableDetector(QThread):
         except Exception as e:
             self.error_occurred.emit(f"Erro na detecção: {str(e)}")
     
+    def process_specific_pages(self, pages):
+        """Processa páginas específicas com sistema híbrido multi-configuração"""
+        self.progress_updated.emit(20, f"Iniciando detecção para páginas: {pages}")
+        
+        # Verificar se é sistema híbrido ou método tradicional
+        if self.method == "hybrid":
+            return self.hybrid_detection_system(str(pages), 20, 80)
+        else:
+            # Método tradicional (stream ou lattice)
+            self.progress_updated.emit(30, f"Método tradicional: {self.method}")
+            
+            if self.method == "lattice":
+                tables = camelot.read_pdf(
+                    self.pdf_path, 
+                    pages=str(pages), 
+                    flavor=self.method,
+                    process_background=True,
+                    line_scale=40
+                )
+            else:
+                tables = camelot.read_pdf(self.pdf_path, pages=str(pages), flavor=self.method)
+            
+            if self.should_stop:
+                return []
+            
+            return self.convert_tables_to_dict(tables, 40, 80)
+    
+    def process_all_pages_in_batches(self, total_pages):
+        """Processa todas as páginas em lotes com sistema híbrido ou tradicional"""
+        batch_size = 50  # Processar 50 páginas por vez
+        all_detected_tables = []
+        
+        # Calcular número de lotes
+        num_batches = (total_pages + batch_size - 1) // batch_size
+        
+        # Definir mensagem baseada no método
+        method_name = "Sistema híbrido" if self.method == "hybrid" else f"método {self.method}"
+        self.progress_updated.emit(20, f"{method_name}: processando {total_pages} páginas em {num_batches} lotes...")
+        
+        for batch_num in range(num_batches):
+            if self.should_stop:
+                break
+            
+            # Calcular intervalo do lote
+            start_page = batch_num * batch_size + 1
+            end_page = min((batch_num + 1) * batch_size, total_pages)
+            
+            # Progresso do lote
+            batch_progress = 20 + int((batch_num / num_batches) * 60)
+            self.progress_updated.emit(
+                batch_progress, 
+                f"Lote {batch_num + 1}/{num_batches}: {method_name} páginas {start_page}-{end_page}..."
+            )
+            
+            try:
+                # Processar lote com sistema apropriado
+                page_range = f"{start_page}-{end_page}"
+                
+                if self.method == "hybrid":
+                    # Usar sistema híbrido
+                    batch_detected = self.hybrid_detection_system(page_range, 0, 0)
+                else:
+                    # Usar método tradicional
+                    if self.method == "lattice":
+                        batch_tables = camelot.read_pdf(
+                            self.pdf_path, 
+                            pages=page_range, 
+                            flavor=self.method,
+                            process_background=True,
+                            line_scale=40
+                        )
+                    else:
+                        batch_tables = camelot.read_pdf(self.pdf_path, pages=page_range, flavor=self.method)
+                    
+                    batch_detected = self.convert_tables_to_dict(batch_tables, 0, 0)
+                
+                if batch_detected:
+                    all_detected_tables.extend(batch_detected)
+                    
+                    self.progress_updated.emit(
+                        batch_progress + 2,
+                        f"Lote {batch_num + 1}: {len(batch_detected)} tabelas encontradas (Total: {len(all_detected_tables)})"
+                    )
+                else:
+                    self.progress_updated.emit(
+                        batch_progress + 2,
+                        f"Lote {batch_num + 1}: nenhuma tabela encontrada"
+                    )
+                
+            except Exception as e:
+                # Se um lote falhar, continua com o próximo
+                self.progress_updated.emit(
+                    batch_progress + 2,
+                    f"Lote {batch_num + 1}: erro ignorado - {str(e)[:50]}..."
+                )
+                continue
+        
+        return all_detected_tables
+    
+    def convert_tables_to_dict(self, tables, start_progress, end_progress):
+        """Converte tabelas do Camelot para formato dict (apenas tabelas válidas)"""
+        detected_tables = []
+        
+        for i, table in enumerate(tables):
+            if self.should_stop:
+                break
+            
+            # Filtrar apenas tabelas com accuracy > 50% (válidas)
+            if not hasattr(table, 'accuracy') or table.accuracy <= 50:
+                continue
+            
+            # Informações da tabela
+            table_info = {
+                "index": len(detected_tables),  # Índice global
+                "page": int(table.page),
+                "bbox": table._bbox,  # (x1, y1, x2, y2)
+                "accuracy": table.accuracy if hasattr(table, 'accuracy') else 0.0,
+                "shape": table.shape,
+                "data": table.df.to_dict('records') if len(table.df) > 0 else [],
+                "preview": table.df.head(3).to_string() if len(table.df) > 0 else "Tabela vazia",
+                "detection_method": f"camelot_{self.method}",
+                "confidence": table.accuracy / 100.0 if hasattr(table, 'accuracy') else 0.0,
+                "estimated_rows": table.shape[0],
+                "estimated_cols": table.shape[1],
+                "validation_passed": True,  # Camelot já fez validação básica
+                "structure_score": 0.8,  # Score padrão
+                "content_score": 0.7,   # Score padrão
+                "column_consistency": 0.9,  # Score padrão
+                "word_count": sum(len(str(cell).split()) for row in table.df.values for cell in row if pd.notna(cell))
+            }
+            detected_tables.append(table_info)
+            
+            # Atualizar progresso se especificado
+            if end_progress > start_progress:
+                progress = start_progress + int((i / len(tables)) * (end_progress - start_progress))
+                self.progress_updated.emit(progress, f"Processando tabela {i+1}/{len(tables)}")
+        
+        return detected_tables
+    
     def stop(self):
         """Para a detecção"""
         self.should_stop = True
+    
+    def hybrid_detection_system(self, page_range, start_progress, end_progress):
+        """Sistema híbrido avançado com múltiplas configurações Camelot"""
+        
+        # Configurações múltiplas para cobertura total
+        configurations = {
+            'padrão': {
+                'flavor': 'lattice',
+                'line_scale': 40,
+                'description': 'Detecção padrão para tabelas bem definidas'
+            },
+            'sensível': {
+                'flavor': 'lattice', 
+                'line_scale': 60,
+                'description': 'Captura tabelas com bordas sutis'
+            },
+            'complementar': {
+                'flavor': 'stream',
+                'description': 'Método alternativo para casos especiais'
+            }
+        }
+        
+        all_tables = []
+        config_count = len(configurations)
+        
+        for i, (config_name, params) in enumerate(configurations.items()):
+            if self.should_stop:
+                break
+            
+            # Progresso da configuração
+            config_progress = start_progress + int((i / config_count) * (end_progress - start_progress) * 0.8)
+            self.progress_updated.emit(
+                config_progress, 
+                f"Configuração '{config_name}': {params['description']}"
+            )
+            
+            try:
+                # Executar detecção com configuração específica
+                if params['flavor'] == 'lattice':
+                    tables = camelot.read_pdf(
+                        self.pdf_path,
+                        pages=page_range,
+                        flavor=params['flavor'],
+                        line_scale=params['line_scale'],
+                        process_background=True
+                    )
+                else:
+                    tables = camelot.read_pdf(
+                        self.pdf_path,
+                        pages=page_range,
+                        flavor=params['flavor']
+                    )
+                
+                # Converter e validar tabelas desta configuração
+                for table in tables:
+                    if self.validate_table_quality(table):
+                        table_data = self.create_table_data(table, config_name)
+                        all_tables.append(table_data)
+                
+                self.progress_updated.emit(
+                    config_progress + 5,
+                    f"'{config_name}': {len([t for t in tables if self.validate_table_quality(t)])} tabelas válidas"
+                )
+                
+            except Exception as e:
+                self.progress_updated.emit(
+                    config_progress + 5,
+                    f"'{config_name}': erro ignorado - {str(e)[:30]}..."
+                )
+                continue
+        
+        # Eliminação de duplicatas com algoritmo avançado
+        elimination_progress = start_progress + int((end_progress - start_progress) * 0.8)
+        self.progress_updated.emit(elimination_progress, "Eliminando duplicatas...")
+        
+        unique_tables = self.eliminate_overlapping_duplicates(all_tables, threshold=0.4)
+        
+        final_progress = start_progress + int((end_progress - start_progress) * 0.9)
+        self.progress_updated.emit(
+            final_progress, 
+            f"Sistema híbrido: {len(unique_tables)} tabelas únicas de {len(all_tables)} detecções"
+        )
+        
+        return unique_tables
+    
+    def validate_table_quality(self, table):
+        """Valida a qualidade da tabela detectada"""
+        try:
+            # Verificar accuracy mínimo
+            if not hasattr(table, 'accuracy') or table.accuracy <= 50:
+                return False
+            
+            # Verificar tamanho mínimo
+            if table.shape[0] < 2 or table.shape[1] < 2:
+                return False
+            
+            # Verificar se tem dados válidos
+            if len(table.df) == 0:
+                return False
+            
+            # Verificar densidade de texto (evitar células isoladas)
+            non_empty_cells = 0
+            total_cells = table.shape[0] * table.shape[1]
+            
+            for row in table.df.values:
+                for cell in row:
+                    if pd.notna(cell) and str(cell).strip():
+                        non_empty_cells += 1
+            
+            density = non_empty_cells / total_cells if total_cells > 0 else 0
+            
+            # Filtrar células muito esparsas (falsos positivos)
+            if density < 0.1:  # Menos de 10% de densidade
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def create_table_data(self, table, config_name):
+        """Cria estrutura de dados para tabela detectada"""
+        return {
+            "page": int(table.page),
+            "bbox": table._bbox,  # (x1, y1, x2, y2) - será convertido com Y-invertida na extração
+            "accuracy": table.accuracy if hasattr(table, 'accuracy') else 0.0,
+            "shape": table.shape,
+            "data": table.df.to_dict('records') if len(table.df) > 0 else [],
+            "preview": table.df.head(3).to_string() if len(table.df) > 0 else "Tabela vazia",
+            "detection_method": f"camelot_hybrid_{config_name}",
+            "config": config_name,
+            "confidence": table.accuracy / 100.0 if hasattr(table, 'accuracy') else 0.0,
+            "estimated_rows": table.shape[0],
+            "estimated_cols": table.shape[1],
+            "validation_passed": True,
+            "word_count": sum(len(str(cell).split()) for row in table.df.values for cell in row if pd.notna(cell))
+        }
+    
+    def eliminate_overlapping_duplicates(self, tables, threshold=0.4):
+        """Elimina tabelas duplicadas usando algoritmo bidireccional de sobreposição"""
+        if not tables:
+            return []
+        
+        unique_tables = []
+        
+        for table in tables:
+            is_duplicate = False
+            
+            for existing in unique_tables:
+                # Verificar se estão na mesma página
+                if table['page'] != existing['page']:
+                    continue
+                
+                # Calcular sobreposição bidireccional
+                overlap_ratio = self.calculate_bidirectional_overlap(
+                    table['bbox'], 
+                    existing['bbox']
+                )
+                
+                if overlap_ratio > threshold:
+                    # É uma duplicata - manter a de maior qualidade
+                    if table['accuracy'] > existing['accuracy']:
+                        # Remover a existente e adicionar a nova
+                        unique_tables.remove(existing)
+                        unique_tables.append(table)
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                unique_tables.append(table)
+        
+        # Reindexar tabelas únicas
+        for i, table in enumerate(unique_tables):
+            table['index'] = i
+        
+        return unique_tables
+    
+    def calculate_bidirectional_overlap(self, bbox1, bbox2):
+        """Calcula sobreposição bidireccional entre duas bounding boxes"""
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        
+        # Área de interseção
+        x_overlap = max(0, min(x1_max, x2_max) - max(x1_min, x2_min))
+        y_overlap = max(0, min(y1_max, y2_max) - max(y1_min, y2_min))
+        intersection_area = x_overlap * y_overlap
+        
+        # Áreas individuais
+        area1 = (x1_max - x1_min) * (y1_max - y1_min)
+        area2 = (x2_max - x2_min) * (y2_max - y2_min)
+        
+        if area1 == 0 or area2 == 0:
+            return 0
+        
+        # Sobreposição bidireccional (máximo das duas direções)
+        overlap1 = intersection_area / area1  # % da bbox1 que sobrepõe bbox2
+        overlap2 = intersection_area / area2  # % da bbox2 que sobrepõe bbox1
+        
+        return max(overlap1, overlap2)
 
 
 class ImageToJsonlConverter(QThread):
@@ -400,6 +726,10 @@ Analise a imagem e retorne APENAS o JSON estruturado, sem explicações adiciona
     def run(self):
         """Executa a extração usando o novo SDK openai e endpoint /responses"""
         try:
+            if not HAS_OPENAI:
+                self.error_occurred.emit("OpenAI não está instalado. Execute: pip install openai")
+                return
+                
             self.progress_updated.emit(10, "Preparando imagem...")
             base64_image = self.encode_image(self.image_path)
             self.progress_updated.emit(30, "Enviando para OpenAI...")
@@ -798,10 +1128,13 @@ class AdvancedTableDetector(QWidget):
         
         # Descrição dos métodos
         description = QLabel("""
-        <b>🎯 Métodos Disponíveis:</b><br>
-        <b>• OpenCV:</b> Detecta linhas e contornos para encontrar tabelas com bordas<br>
-        <b>• Tesseract OCR:</b> Analisa alinhamento de texto para detectar estruturas tabulares<br>
-        <b>• Híbrido:</b> Combina ambos os métodos para maior precisão
+        <b>🎯 Sistema Híbrido Camelot v3.0 (NOVO!):</b><br>
+        <b>• Configuração 'Padrão':</b> Lattice com line_scale=40 para tabelas bem definidas<br>
+        <b>• Configuração 'Sensível':</b> Lattice com line_scale=60 para bordas sutis<br>
+        <b>• Configuração 'Complementar':</b> Stream para casos especiais<br>
+        <b>• Anti-Duplicatas:</b> Algoritmo 40% threshold bidireccional<br>
+        <b>• Coordenadas Y-Invertidas:</b> Extração pixel-perfect garantida<br>
+        <b>• Processamento em Lote:</b> Chunks de 50 páginas para otimização
         """)
         description.setStyleSheet("background-color: #f8f9fa; padding: 15px; border-radius: 8px; color: #2c3e50;")
         layout.addWidget(description)
@@ -846,16 +1179,22 @@ class AdvancedTableDetector(QWidget):
         # Método de detecção
         self.method_combo = QComboBox()
         self.method_combo.addItems([
+            "🔬 Sistema Híbrido Camelot v3.0 (Recomendado)",
+            "Camelot Stream (PDF com texto - sem bordas)",
+            "Camelot Lattice (PDF com texto - com bordas)",
             "OpenCV (Linhas e Contornos)",
             "OpenCV Multi-Passadas (Múltiplas Tabelas)",
             "Tesseract OCR (Análise de Texto)", 
             "Híbrido (OpenCV + Tesseract)"
         ])
-        self.method_combo.setCurrentIndex(3)  # Híbrido por padrão
+        self.method_combo.setCurrentIndex(0)  # Sistema Híbrido por padrão
+        self.method_combo.currentTextChanged.connect(self.on_method_changed)
         self.method_combo.setToolTip(
+            "• Sistema Híbrido v3.0: 3 configurações + anti-duplicatas + Y-invertida\n"
+            "• Camelot Stream: Para PDFs com texto, tabelas sem bordas definidas\n"
+            "• Camelot Lattice: Para PDFs com texto, tabelas com bordas\n"
             "• OpenCV: Detecção baseada em linhas e contornos\n"
-            "• OpenCV Multi-Passadas: Para páginas com múltiplas tabelas - "
-            "extrai uma tabela por vez, pintando de branco as já extraídas\n"
+            "• OpenCV Multi-Passadas: Para páginas com múltiplas tabelas\n"
             "• Tesseract OCR: Análise baseada em texto\n"
             "• Híbrido: Combina OpenCV e Tesseract"
         )
@@ -863,29 +1202,63 @@ class AdvancedTableDetector(QWidget):
         
         # Páginas
         self.pages_input = QLineEdit()
-        self.pages_input.setPlaceholderText("Ex: 1,3,5-10 ou deixe vazio para todas as páginas")
+        self.pages_input.setPlaceholderText("Ex: 1728,1729 ou 1700-1750 ou deixe vazio para todas")
+        self.pages_input.setToolTip(
+            "Especifique páginas para análise:\n"
+            "Exemplos:\n"
+            "• 1,2,3 - páginas específicas\n"
+            "• 10-20 - intervalo de páginas\n"
+            "• 1,5,10-15,20 - combinação\n"
+            "• Vazio - todas as páginas (processamento em lotes)"
+        )
         config_layout.addRow("Páginas:", self.pages_input)
         
+        # Configurações Camelot (aparecem/desaparecem conforme método)
+        self.camelot_group = QGroupBox("Configurações Camelot")
+        camelot_layout = QFormLayout(self.camelot_group)
+        
+        # Tolerâncias
+        camelot_tolerances = QHBoxLayout()
+        
+        self.edge_tol_input = QLineEdit("50")
+        self.edge_tol_input.setPlaceholderText("50")
+        self.edge_tol_input.setMaximumWidth(80)
+        self.edge_tol_input.setToolTip("Tolerância de borda para detectar linhas de tabela")
+        camelot_tolerances.addWidget(QLabel("Tolerância de Borda:"))
+        camelot_tolerances.addWidget(self.edge_tol_input)
+        
+        self.row_tol_input = QLineEdit("2")
+        self.row_tol_input.setPlaceholderText("2")
+        self.row_tol_input.setMaximumWidth(80)
+        self.row_tol_input.setToolTip("Tolerância entre linhas da tabela")
+        camelot_tolerances.addWidget(QLabel("Tolerância de Linha:"))
+        camelot_tolerances.addWidget(self.row_tol_input)
+        
+        camelot_tolerances.addStretch()
+        camelot_layout.addRow("Avançado:", camelot_tolerances)
+        
+        config_layout.addRow("", self.camelot_group)
+        
         # Configurações OpenCV
-        opencv_group = QGroupBox("Configurações OpenCV")
-        opencv_layout = QFormLayout(opencv_group)
+        self.opencv_group = QGroupBox("Configurações OpenCV")
+        opencv_layout = QFormLayout(self.opencv_group)
         
         self.min_area_input = QLineEdit("3000")  # Reduzido de 5000 para 3000
         self.min_area_input.setPlaceholderText("3000")
         opencv_layout.addRow("Área Mínima da Tabela:", self.min_area_input)
         
-        config_layout.addRow("", opencv_group)
+        config_layout.addRow("", self.opencv_group)
         
         # Configurações Tesseract
-        tesseract_group = QGroupBox("Configurações Tesseract")
-        tesseract_layout = QFormLayout(tesseract_group)
+        self.tesseract_group = QGroupBox("Configurações Tesseract")
+        tesseract_layout = QFormLayout(self.tesseract_group)
         
         self.language_combo = QComboBox()
         self.language_combo.addItems(["por", "eng", "spa", "fra"])
         self.language_combo.setCurrentText("por")
         tesseract_layout.addRow("Idioma:", self.language_combo)
         
-        config_layout.addRow("", tesseract_group)
+        config_layout.addRow("", self.tesseract_group)
         
         layout.addWidget(config_section)
         
@@ -951,6 +1324,22 @@ class AdvancedTableDetector(QWidget):
         results_layout.addWidget(self.results_list)
         
         layout.addWidget(results_section)
+        
+        # Inicializar visibilidade das configurações
+        self.on_method_changed()
+    
+    def on_method_changed(self):
+        """Mostra/esconde configurações baseado no método selecionado"""
+        method = self.method_combo.currentText()
+        
+        # Mostrar/esconder configurações específicas
+        is_camelot = "Camelot" in method
+        is_opencv = "OpenCV" in method
+        is_tesseract = "Tesseract" in method
+        
+        self.camelot_group.setVisible(is_camelot)
+        self.opencv_group.setVisible(is_opencv)
+        self.tesseract_group.setVisible(is_tesseract)
     
     def select_pdf(self):
         """Seleciona PDF para análise"""
@@ -986,6 +1375,29 @@ class AdvancedTableDetector(QWidget):
         method = self.method_combo.currentText()
         pages = self.pages_input.text().strip() or "all"
         
+        # Informação especial para Camelot com PDFs grandes
+        if "Camelot" in method and pages == "all":
+            try:
+                import fitz
+                doc = fitz.open(self.pdf_path)
+                total_pages = len(doc)
+                doc.close()
+                
+                if total_pages > 100:
+                    QMessageBox.information(
+                        self,
+                        "📊 PDF Grande Detectado",
+                        f"O PDF tem {total_pages} páginas.\n\n"
+                        f"� O Camelot processará em lotes de 50 páginas para:\n"
+                        f"• Evitar problemas de memória\n"
+                        f"• Permitir acompanhar o progresso\n"
+                        f"• Continuar mesmo se algumas páginas falharem\n\n"
+                        f"⏱️ Isso pode levar alguns minutos...\n"
+                        f"💡 Para resultados mais rápidos, especifique páginas específicas."
+                    )
+            except:
+                pass  # Se não conseguir verificar, continua normalmente
+        
         # Configurar interface
         self.detect_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -994,9 +1406,16 @@ class AdvancedTableDetector(QWidget):
         self.results_list.clear()
         
         # Escolher detector baseado no método
-        if "OpenCV Multi-Passadas" in method:
+        if "Sistema Híbrido Camelot v3.0" in method:
+            # Usar sistema híbrido avançado - método "hybrid" especial
+            self.detector_thread = CamelotTableDetector(self.pdf_path, pages, "hybrid")
+        elif "Camelot" in method:
+            # Usar Camelot tradicional
+            camelot_method = "stream" if "Stream" in method else "lattice"
+            self.detector_thread = CamelotTableDetector(self.pdf_path, pages, camelot_method)
+        elif "OpenCV Multi-Passadas" in method:
             min_area = int(self.min_area_input.text() or "5000")
-            max_passes = 5  # Máximo de 5 passadas
+            max_passes = 8  # Aumentado para 8 passadas para detectar mais tabelas
             self.detector_thread = MultiPassTableDetector(self.pdf_path, pages, max_passes)
         elif "OpenCV" in method:
             min_area = int(self.min_area_input.text() or "5000")
@@ -1004,15 +1423,29 @@ class AdvancedTableDetector(QWidget):
         elif "Tesseract" in method:
             language = self.language_combo.currentText()
             self.detector_thread = TesseractTableDetector(self.pdf_path, pages, language)
-        else:  # Híbrido
-            # Para método híbrido, vamos executar OpenCV primeiro
+        else:  # Híbrido tradicional (OpenCV + Tesseract)
+            # Para método híbrido tradicional, vamos executar OpenCV primeiro
             min_area = int(self.min_area_input.text() or "5000")
             self.detector_thread = OpenCVTableDetector(self.pdf_path, pages, min_area)
         
         # Conectar sinais
         self.detector_thread.progress_updated.connect(self.update_progress)
-        self.detector_thread.tables_detected.connect(self.on_tables_detected)
         self.detector_thread.error_occurred.connect(self.on_detection_error)
+        
+        # Conectar sinais específicos baseado no tipo de detector
+        if "Camelot" in method:
+            # Camelot tem sinais específicos
+            self.detector_thread.tables_detected.connect(self.on_tables_detected)
+            if hasattr(self.detector_thread, 'pdf_type_detected'):
+                self.detector_thread.pdf_type_detected.connect(self.on_pdf_type_detected)
+        else:
+            # Outros detectores usam sinal padrão
+            self.detector_thread.tables_detected.connect(self.on_tables_detected)
+        
+        # Conectar sinal específico para multi-passadas (PDF final exportado)
+        if hasattr(self.detector_thread, 'final_pdf_saved'):
+            self.detector_thread.final_pdf_saved.connect(self.on_final_pdf_saved)
+        
         self.detector_thread.start()
     
     def update_progress(self, progress, message):
@@ -1111,6 +1544,68 @@ class AdvancedTableDetector(QWidget):
         self.results_info_label.setText("❌ Erro na detecção")
         QMessageBox.critical(self, "Erro na Detecção", error_message)
     
+    def on_pdf_type_detected(self, pdf_type, has_text):
+        """Callback específico do Camelot para informar sobre o tipo de PDF"""
+        if pdf_type == "text-based" and has_text:
+            self.results_info_label.setText("✅ PDF com texto detectado. Continuando com Camelot...")
+        elif pdf_type == "image-based":
+            self.results_info_label.setText("⚠️ PDF baseado em imagens detectado. Camelot pode ter resultados limitados.")
+    
+    def on_final_pdf_saved(self, pdf_path):
+        """Callback para quando o PDF final com regiões pintadas é exportado"""
+        msg = QMessageBox()
+        msg.setWindowTitle("📄 PDF com Regiões Extraídas Exportado")
+        msg.setIcon(QMessageBox.Information)
+        
+        pdf_name = os.path.basename(pdf_path)
+        pdf_dir = os.path.dirname(pdf_path)
+        
+        msg.setText(f"✅ PDF exportado com sucesso!")
+        msg.setInformativeText(
+            f"O PDF com as regiões de tabelas pintadas de branco foi salvo em:\n\n"
+            f"📁 {pdf_dir}\n"
+            f"📄 {pdf_name}\n\n"
+            f"💡 Use este PDF para verificar se alguma tabela ficou para trás.\n"
+            f"As áreas BRANCAS mostram onde as tabelas foram detectadas e extraídas."
+        )
+        
+        # Botões para ações
+        open_btn = msg.addButton("🔍 Abrir PDF", QMessageBox.ActionRole)
+        open_folder_btn = msg.addButton("📁 Abrir Pasta", QMessageBox.ActionRole)
+        ok_btn = msg.addButton("✅ OK", QMessageBox.AcceptRole)
+        
+        msg.exec_()
+        
+        # Processar ação escolhida
+        if msg.clickedButton() == open_btn:
+            self.open_file(pdf_path)
+        elif msg.clickedButton() == open_folder_btn:
+            self.open_folder(pdf_dir)
+    
+    def open_file(self, file_path):
+        """Abre um arquivo com o aplicativo padrão do sistema"""
+        try:
+            if platform.system() == 'Windows':
+                os.startfile(file_path)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.call(['open', file_path])
+            else:  # Linux
+                subprocess.call(['xdg-open', file_path])
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Não foi possível abrir o arquivo:\n{str(e)}")
+    
+    def open_folder(self, folder_path):
+        """Abre uma pasta no explorador de arquivos"""
+        try:
+            if platform.system() == 'Windows':
+                subprocess.run(['explorer', folder_path])
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.call(['open', folder_path])
+            else:  # Linux
+                subprocess.call(['xdg-open', folder_path])
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Não foi possível abrir a pasta:\n{str(e)}")
+    
     def on_selection_changed(self):
         """Atualiza interface quando seleção muda"""
         selected = self.results_list.selectedItems()
@@ -1168,8 +1663,22 @@ class AdvancedTableDetector(QWidget):
                 
                 # Extrair região da tabela
                 page = doc.load_page(page_num - 1)
-                rect = fitz.Rect(bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
-                pix = page.get_pixmap(clip=rect, dpi=150)
+                
+                # CORREÇÃO: Sistema de coordenadas Y (Camelot vs PyMuPDF)
+                page_height = page.rect.height
+                margin = 15  # Margem para capturar conteúdo ao redor
+                
+                # Camelot usa Y crescendo para baixo, PyMuPDF usa Y crescendo para cima
+                # Inverter coordenadas Y
+                expanded_bbox = [
+                    max(0, bbox[0] - margin),
+                    max(0, page_height - bbox[3] - margin),  # Y invertido
+                    min(page.rect.width, bbox[2] + margin),
+                    min(page.rect.height, page_height - bbox[1] + margin)  # Y invertido
+                ]
+                
+                rect = fitz.Rect(expanded_bbox)
+                pix = page.get_pixmap(clip=rect, dpi=200)  # Maior resolução
                 
                 # Converter e salvar
                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
@@ -1640,10 +2149,20 @@ class CamelotPDFAnalyzer(QWidget):
                 # Carregar página
                 page = doc.load_page(page_num - 1)  # Camelot usa 1-based, fitz usa 0-based
                 
-                # Extrair região da tabela
-                # Converter de (x, y, width, height) para (x1, y1, x2, y2)
-                rect = fitz.Rect(bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3])
-                pix = page.get_pixmap(clip=rect, dpi=150)
+                # Extrair região da tabela com correção de coordenadas Y
+                page_height = page.rect.height
+                margin = 15  # Margem para capturar conteúdo ao redor das bordas
+                
+                # CORREÇÃO: Camelot usa Y crescendo para baixo, PyMuPDF usa Y crescendo para cima
+                expanded_bbox = [
+                    max(0, bbox[0] - margin),
+                    max(0, page_height - bbox[3] - margin),  # Y invertido
+                    min(page.rect.width, bbox[2] + margin),
+                    min(page.rect.height, page_height - bbox[1] + margin)  # Y invertido
+                ]
+                
+                rect = fitz.Rect(expanded_bbox)
+                pix = page.get_pixmap(clip=rect, dpi=250)  # Alta resolução para melhor qualidade
                 
                 # Converter para QImage
                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
@@ -1728,7 +2247,11 @@ class CamelotTableDetectorWidget(QWidget):
         # Método de detecção
         self.method_combo = QComboBox()
         self.method_combo.addItems(["stream", "lattice"])
-        self.method_combo.setCurrentText("stream")
+        self.method_combo.setCurrentText("lattice")  # Padrão para lattice agora
+        self.method_combo.setToolTip(
+            "• Stream: Detecta tabelas baseado no texto\n"
+            "• Lattice: Detecta tabelas baseado nas bordas (🆕 Configuração otimizada - detecta mais tabelas!)"
+        )
         config_layout.addRow("Método:", self.method_combo)
         
         # Páginas a processar
@@ -1794,9 +2317,14 @@ class CamelotTableDetectorWidget(QWidget):
         instructions = QLabel("""
         <b>Como usar:</b><br>
         1. Selecione um PDF primeiro na área principal<br>
-        2. Escolha o método: "stream" para texto alinhado, "lattice" para tabelas com bordas<br>
+        2. Escolha o método: "stream" para texto alinhado, "lattice" para tabelas com bordas (🆕 otimizado!)<br>
         3. Especifique páginas (opcional) ou deixe vazio para todas<br>
         4. Clique em "Detectar Tabelas"<br>
+        <br>
+        <b>🎯 Filtros automáticos:</b><br>
+        • Apenas tabelas com accuracy > 50% são mostradas<br>
+        • Extração com alta resolução (DPI 250) e margem<br>
+        • Dados salvos em CSV + imagens PNG de qualidade
         5. Selecione as tabelas desejadas na lista<br>
         6. Clique em "Exportar Selecionadas" para extrair as tabelas
         """)
@@ -2367,26 +2895,22 @@ class PDFTableExtractor(QWidget):
         • Aguarde o carregamento completo do PDF<br>
         • Clique em dois pontos para selecionar uma tabela (mesmo página ou entre páginas)<br>
         • Use "Salvar Tabelas Selecionadas" para extrair as imagens<br>
-        • Para detecção automática, use a aba "🔍 Camelot"
+        • Para detecção automática, use a aba "� Detecção Avançada" (inclui Camelot, OpenCV, Tesseract)
         """)
         manual_instructions.setStyleSheet("background-color: #e8f6f3; padding: 10px; border-radius: 5px; color: #2c3e50;")
         extraction_layout.addWidget(manual_instructions)
         
         self.tabs.addTab(extraction_tab, "📄 Seleção Manual")
         
-        # Tab 2: Camelot - Detecção Automática
-        self.camelot_analyzer = CamelotPDFAnalyzer()
-        self.tabs.addTab(self.camelot_analyzer, "� Camelot")
-        
-        # Tab 3: Visualizador de tabelas
+        # Tab 2: Visualizador de tabelas
         self.image_viewer = ImageViewer()
         self.tabs.addTab(self.image_viewer, "🖼️ Visualizar Tabelas")
         
-        # Tab 4: Detecção Avançada
+        # Tab 3: Detecção Avançada
         self.advanced_detector = AdvancedTableDetector()
         self.tabs.addTab(self.advanced_detector, "🔬 Detecção Avançada")
         
-        # Tab 5: Extração com IA
+        # Tab 4: Extração com IA
         self.ai_extractor = AITableExtractorWidget()
         self.tabs.addTab(self.ai_extractor, "🤖 IA - Extração Automática")
         
